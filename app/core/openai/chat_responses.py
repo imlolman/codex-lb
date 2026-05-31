@@ -179,12 +179,22 @@ class ToolCallIndex:
             self.output_index_map[output_index] = index
 
 
+# Reasoning ("thinking") summaries are streamed inside the assistant ``content``
+# as a collapsible Markdown block. Chat-completions clients (notably Cursor) do
+# not render a separate ``reasoning`` field, but they do render ``<details>`` in
+# the message content, so this surfaces the thinking trace without breaking the
+# Chat Completions contract.
+_THINK_OPEN = "<details><summary>Thinking</summary>\n\n"
+_THINK_CLOSE = "\n\n</details>\n\n"
+
+
 @dataclass
 class _ChatChunkState:
     tool_index: ToolCallIndex = field(default_factory=ToolCallIndex)
     tool_calls: list["ToolCallState"] = field(default_factory=list)
     saw_tool_call: bool = False
     sent_role: bool = False
+    thinking_open: bool = False
 
 
 @dataclass
@@ -290,7 +300,47 @@ def iter_chat_chunks(
         if not payload:
             continue
         event_type = payload.get("type")
+        if event_type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+            reasoning_text = payload.get("delta")
+            if isinstance(reasoning_text, str) and reasoning_text:
+                role = None
+                if not state.sent_role:
+                    role = "assistant"
+                # Open the collapsible block on the first reasoning delta.
+                content_text = reasoning_text
+                if not state.thinking_open:
+                    content_text = _THINK_OPEN + reasoning_text
+                    state.thinking_open = True
+                chunk = ChatCompletionChunk(
+                    id="chatcmpl_temp",
+                    created=created,
+                    model=model,
+                    choices=[
+                        ChatChunkChoice(
+                            index=0,
+                            delta=ChatChunkDelta(role=role, content=content_text),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                yield _dump_chunk(chunk, include_usage=include_usage)
+                if role is not None:
+                    state.sent_role = True
         if event_type in ("response.output_text.delta", "response.refusal.delta"):
+            # Close the thinking block before the first visible answer token.
+            if state.thinking_open:
+                state.thinking_open = False
+                yield _dump_chunk(
+                    ChatCompletionChunk(
+                        id="chatcmpl_temp",
+                        created=created,
+                        model=model,
+                        choices=[
+                            ChatChunkChoice(index=0, delta=ChatChunkDelta(content=_THINK_CLOSE), finish_reason=None)
+                        ],
+                    ),
+                    include_usage=include_usage,
+                )
             delta_text = payload.get("delta")
             role = None
             if not state.sent_role:
@@ -365,6 +415,20 @@ def iter_chat_chunks(
                 yield "data: [DONE]\n\n"
                 return
         if event_type in ("response.completed", "response.incomplete"):
+            # Close a thinking block that never saw a following answer token.
+            if state.thinking_open:
+                state.thinking_open = False
+                yield _dump_chunk(
+                    ChatCompletionChunk(
+                        id="chatcmpl_temp",
+                        created=created,
+                        model=model,
+                        choices=[
+                            ChatChunkChoice(index=0, delta=ChatChunkDelta(content=_THINK_CLOSE), finish_reason=None)
+                        ],
+                    ),
+                    include_usage=include_usage,
+                )
             for tool_state in state.tool_calls:
                 stream_delta = tool_state.build_stream_delta()
                 if stream_delta is None:
@@ -453,6 +517,7 @@ async def stream_chat_chunks(
 async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> ChatCompletionResult:
     created = int(time.time())
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     refusal_parts: list[str] = []
     response_id: str | None = None
     usage: ResponseUsage | None = None
@@ -469,6 +534,10 @@ async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> Cha
             delta = payload.get("delta")
             if isinstance(delta, str):
                 content_parts.append(delta)
+        if event_type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                reasoning_parts.append(delta)
         if event_type == "response.refusal.delta":
             delta = payload.get("delta")
             if isinstance(delta, str):
@@ -502,10 +571,17 @@ async def collect_chat_completion(stream: AsyncIterator[str], model: str) -> Cha
                     incomplete_reason = _finish_reason_from_incomplete(response)
 
     message_content: str | None = "".join(content_parts)
+    message_reasoning = "".join(reasoning_parts)
     message_refusal = "".join(refusal_parts) or None
     message_tool_calls = _compact_tool_calls(tool_calls)
     has_tool_calls = bool(message_tool_calls)
     finish_reason = "tool_calls" if has_tool_calls else (incomplete_reason or "stop")
+    # Prepend the reasoning as a collapsible block so clients that render content
+    # markdown (e.g. Cursor) can show the thinking trace.
+    if message_reasoning and message_content:
+        message_content = _THINK_OPEN + message_reasoning + _THINK_CLOSE + message_content
+    elif message_reasoning and not (has_tool_calls or message_refusal):
+        message_content = _THINK_OPEN + message_reasoning + _THINK_CLOSE
     if (has_tool_calls or message_refusal) and not message_content:
         message_content = None
     message = ChatCompletionMessage(
