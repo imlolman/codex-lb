@@ -15,6 +15,10 @@ from app.core.openai.requests import (
     normalize_tool_type,
     validate_tool_types,
 )
+from app.core.openai.responses_style_chat import (
+    is_responses_style_chat_body,
+    responses_style_to_chat_body,
+)
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_list, is_json_mapping
 
@@ -65,6 +69,18 @@ class ChatCompletionsRequest(BaseModel):
     max_completion_tokens: int | None = None
     store: bool | None = None
     stream_options: ChatStreamOptions | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_responses_style_body(cls, data: JsonValue) -> JsonValue:
+        # Clients such as the Cursor agent POST a Responses-API-shaped body
+        # (``input`` instead of ``messages``) to ``/v1/chat/completions``.
+        # Normalize it into Chat Completions semantics so the existing
+        # ``to_responses_request`` mapping can handle it. Standard requests
+        # that already carry ``messages`` are left untouched.
+        if is_responses_style_chat_body(data):
+            return responses_style_to_chat_body(cast(Mapping[str, JsonValue], data))
+        return data
 
     @field_validator("tools")
     @classmethod

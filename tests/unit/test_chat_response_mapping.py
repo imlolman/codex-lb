@@ -358,6 +358,59 @@ async def test_collect_completion_merges_tool_call_arguments():
     assert function.arguments == '{"a":1}'
 
 
+def test_reasoning_summary_streamed_as_thinking_block_before_content():
+    lines = [
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"think"}\n\n',
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"ing"}\n\n',
+        'data: {"type":"response.output_text.delta","delta":"answer"}\n\n',
+        'data: {"type":"response.completed","response":{"id":"r1"}}\n\n',
+    ]
+    parsed = [
+        json.loads(chunk[5:].strip())
+        for chunk in iter_chat_chunks(lines, model="gpt-5.2")
+        if chunk.startswith("data: ") and "chat.completion.chunk" in chunk
+    ]
+    contents = [item["choices"][0]["delta"].get("content", "") for item in parsed]
+    joined = "".join(contents)
+    # Reasoning is wrapped in a collapsible block that precedes the answer.
+    assert "<details><summary>Thinking</summary>" in joined
+    assert joined.index("think") < joined.index("</details>") < joined.index("answer")
+    assert parsed[0]["choices"][0]["delta"]["role"] == "assistant"
+    # No separate reasoning field is emitted.
+    assert not any("reasoning" in chunk for chunk in iter_chat_chunks(lines, model="gpt-5.2"))
+
+
+def test_no_thinking_block_without_reasoning_events():
+    lines = [
+        'data: {"type":"response.output_text.delta","delta":"hi"}\n\n',
+        'data: {"type":"response.completed","response":{"id":"r1"}}\n\n',
+    ]
+    chunks = list(iter_chat_chunks(lines, model="gpt-5.2"))
+    assert not any("<details>" in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_collect_completion_embeds_reasoning_block():
+    lines = [
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"because "}\n\n',
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"reasons"}\n\n',
+        'data: {"type":"response.output_text.delta","delta":"42"}\n\n',
+        'data: {"type":"response.completed","response":{"id":"r1"}}\n\n',
+    ]
+
+    async def _stream():
+        for line in lines:
+            yield line
+
+    result = await collect_chat_completion(_stream(), model="gpt-5.2")
+    assert isinstance(result, ChatCompletion)
+    content = result.choices[0].message.content
+    assert content is not None
+    assert content.startswith("<details><summary>Thinking</summary>")
+    assert "because reasons" in content
+    assert content.endswith("42")
+
+
 @pytest.mark.asyncio
 async def test_collect_completion_prefers_final_tool_call_snapshot_without_duplication():
     lines = [

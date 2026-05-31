@@ -347,3 +347,44 @@ async def test_v1_chat_completions_stream_include_usage(async_client, monkeypatc
     assert all("usage" in chunk for chunk in chunks)
     assert chunks[0]["usage"] is None
     assert chunks[-1]["usage"]["total_tokens"] == 5
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_accepts_responses_style_body(async_client, monkeypatch):
+    """Clients such as Cursor POST a Responses-shaped body (``input``) to the
+    chat endpoint; it must be normalized and answered as chat.completion.chunk."""
+
+    email = "responsesstyle@example.com"
+    raw_account_id = "acc_responsesstyle"
+    auth_json = _make_auth_json(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    captured: dict[str, object] = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        captured["payload"] = payload
+        yield 'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+        yield 'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n'
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    # Responses-API shape: ``input`` instead of ``messages``, a flat tool, and an
+    # unsupported ``user`` field that must be dropped before reaching upstream.
+    payload = {
+        "model": "gpt-5.2",
+        "user": "cursor-user",
+        "stream": True,
+        "input": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "name": "noop", "parameters": {"type": "object"}}],
+    }
+    async with async_client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    assert any("chat.completion.chunk" in line for line in lines)
+    forwarded = captured["payload"]
+    assert forwarded.model == "gpt-5.2"
+    assert forwarded.input == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+    assert getattr(forwarded, "user", None) is None
